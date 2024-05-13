@@ -1,3 +1,16 @@
+#   Copyright 2024 The PyMC Labs Developers
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 import os
 
 import arviz as az
@@ -115,6 +128,15 @@ def mmm_fitted(
 
 
 @pytest.fixture(scope="module")
+def mmm_fitted_with_posterior_predictive(
+    mmm_fitted: DelayedSaturatedMMM,
+    toy_X: pd.DataFrame,
+) -> DelayedSaturatedMMM:
+    _ = mmm_fitted.sample_posterior_predictive(toy_X, extend_idata=True, combined=True)
+    return mmm_fitted
+
+
+@pytest.fixture(scope="module")
 def mmm_fitted_with_fourier_features(
     mmm_with_fourier_features: DelayedSaturatedMMM,
     toy_X: pd.DataFrame,
@@ -193,6 +215,11 @@ class TestDelayedSaturatedMMM:
         argvalues=[None, 2],
         ids=["no_yearly_seasonality", "yearly_seasonality"],
     )
+    @pytest.mark.parametrize(
+        argnames="time_varying_intercept",
+        argvalues=[False, True],
+        ids=["no_time_varying_intercept", "time_varying_intercept"],
+    )
     def test_init(
         self,
         toy_X: pd.DataFrame,
@@ -201,6 +228,7 @@ class TestDelayedSaturatedMMM:
         channel_columns: list[str],
         control_columns: list[str],
         adstock_max_lag: int,
+        time_varying_intercept: bool,
     ) -> None:
         mmm = BaseDelayedSaturatedMMM(
             date_column="date",
@@ -208,6 +236,7 @@ class TestDelayedSaturatedMMM:
             control_columns=control_columns,
             adstock_max_lag=adstock_max_lag,
             yearly_seasonality=yearly_seasonality,
+            time_varying_intercept=time_varying_intercept,
         )
         mmm.build_model(X=toy_X, y=toy_y)
         n_channel: int = len(mmm.channel_columns)
@@ -217,13 +246,10 @@ class TestDelayedSaturatedMMM:
                 samples=samples, random_seed=rng
             )
 
-        assert (
-            az.extract(
-                prior_predictive, group="prior", var_names=["intercept"], combined=True
-            )
-            .to_numpy()
-            .size
-            == samples
+        assert az.extract(
+            prior_predictive, group="prior", var_names=["intercept"], combined=True
+        ).to_numpy().shape == (
+            (samples,) if not time_varying_intercept else (toy_X.shape[0], samples)
         )
         assert az.extract(
             data=prior_predictive,
@@ -285,7 +311,6 @@ class TestDelayedSaturatedMMM:
         assert mmm.model_config is not None
         n_channel: int = len(mmm.channel_columns)
         n_control: int = len(mmm.control_columns)
-        fourier_terms: int = 2 * mmm.yearly_seasonality
         mmm.fit(
             X=toy_X,
             y=toy_y,
@@ -322,17 +347,23 @@ class TestDelayedSaturatedMMM:
         )
         assert mean_model_contributions_ts.shape == (
             toy_X.shape[0],
-            n_channel + n_control + fourier_terms + 1,
+            n_channel
+            + n_control
+            + 2,  # 2 for yearly seasonality (+1) and intercept (+)
         )
+
+        processed_df = mmm._process_decomposition_components(
+            data=mean_model_contributions_ts
+        )
+
+        assert processed_df.shape == (n_channel + n_control + 2, 3)
+
         assert mean_model_contributions_ts.columns.tolist() == [
             "channel_1",
             "channel_2",
             "control_1",
             "control_2",
-            "sin_order_1",
-            "cos_order_1",
-            "sin_order_2",
-            "cos_order_2",
+            "yearly_seasonality",
             "intercept",
         ]
 
@@ -392,6 +423,71 @@ class TestDelayedSaturatedMMM:
             x=channel_contributions_forward_pass_mean / channel_contributions_mean,
             y=mmm_fitted.y.max(),
         )
+
+    @pytest.mark.parametrize(
+        argnames="original_scale",
+        argvalues=[False, True],
+        ids=["scaled", "original-scale"],
+    )
+    def test_get_errors(
+        self,
+        mmm_fitted_with_posterior_predictive: DelayedSaturatedMMM,
+        original_scale: bool,
+    ) -> None:
+        errors = mmm_fitted_with_posterior_predictive.get_errors(
+            original_scale=original_scale
+        )
+        n_chains = 2
+        n_draws = 3
+        assert isinstance(errors, xr.DataArray)
+        assert errors.name == "errors"
+        assert errors.shape == (
+            n_chains,
+            n_draws,
+            mmm_fitted_with_posterior_predictive.y.shape[0],
+        )
+
+    def test_get_errors_raises_not_fitted(self) -> None:
+        my_mmm = DelayedSaturatedMMM(
+            date_column="date",
+            channel_columns=["channel_1", "channel_2"],
+            adstock_max_lag=4,
+            control_columns=["control_1", "control_2"],
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="Make sure the model has bin fitted and the posterior predictive has been sampled!",
+        ):
+            my_mmm.get_errors()
+
+    def test_posterior_predictive_raises_not_fitted(self) -> None:
+        my_mmm = DelayedSaturatedMMM(
+            date_column="date",
+            channel_columns=["channel_1", "channel_2"],
+            adstock_max_lag=4,
+            control_columns=["control_1", "control_2"],
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="Make sure the model has bin fitted and the posterior predictive has been sampled!",
+        ):
+            my_mmm.plot_posterior_predictive()
+
+    def test_get_errors_bad_y_length(
+        self,
+        mmm_fitted_with_posterior_predictive: DelayedSaturatedMMM,
+    ):
+        mmm_fitted_with_posterior_predictive.y = np.array([1, 2])
+        with pytest.raises(ValueError):
+            mmm_fitted_with_posterior_predictive.get_errors()
+
+    def test_plot_posterior_predictive_bad_y_length(
+        self,
+        mmm_fitted_with_posterior_predictive: DelayedSaturatedMMM,
+    ):
+        mmm_fitted_with_posterior_predictive.y = np.array([1, 2])
+        with pytest.raises(ValueError):
+            mmm_fitted_with_posterior_predictive.plot_posterior_predictive()
 
     def test_channel_contributions_forward_pass_is_consistent(
         self, mmm_fitted: DelayedSaturatedMMM

@@ -1,3 +1,16 @@
+#   Copyright 2024 The PyMC Labs Developers
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 """Base class for Marketing Mix Models (MMM)."""
 
 import warnings
@@ -19,6 +32,7 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 import seaborn as sns
+from numpy.typing import NDArray
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer
 from xarray import DataArray, Dataset
@@ -26,11 +40,13 @@ from xarray import DataArray, Dataset
 from pymc_marketing.mmm.budget_optimizer import budget_allocator
 from pymc_marketing.mmm.transformers import michaelis_menten
 from pymc_marketing.mmm.utils import (
+    apply_sklearn_transformer_across_dim,
     estimate_menten_parameters,
     estimate_sigmoid_parameters,
     find_sigmoid_inflection_point,
     sigmoid_saturation,
     standardize_scenarios_dict_keys,
+    transform_1d_array,
 )
 from pymc_marketing.mmm.validating import (
     ValidateChannelColumns,
@@ -55,13 +71,19 @@ class BaseMMM(ModelBuilder):
         sampler_config: dict | None = None,
         **kwargs,
     ) -> None:
-        self.X: pd.DataFrame | None = None
-        self.y: pd.Series | np.ndarray | None = None
         self.date_column: str = date_column
         self.channel_columns: list[str] | tuple[str] = channel_columns
+
         self.n_channel: int = len(channel_columns)
-        self._fit_result: az.InferenceData | None = None
-        self._posterior_predictive: az.InferenceData | None = None
+
+        self.X: pd.DataFrame
+        self.y: pd.Series | np.ndarray
+
+        self._time_resolution: int
+        self._time_index: NDArray[np.int_]
+        self._time_index_mid: int
+        self._fit_result: az.InferenceData
+        self._posterior_predictive: az.InferenceData
         super().__init__(model_config=model_config, sampler_config=sampler_config)
 
     @property
@@ -314,59 +336,190 @@ class BaseMMM(ModelBuilder):
         return fig
 
     def plot_posterior_predictive(
-        self, original_scale: bool = False, **plt_kwargs: Any
+        self, original_scale: bool = False, ax: plt.Axes = None, **plt_kwargs: Any
     ) -> plt.Figure:
-        posterior_predictive_data: Dataset = self.posterior_predictive
-        likelihood_hdi_94: DataArray = az.hdi(
-            ary=posterior_predictive_data, hdi_prob=0.94
-        )[self.output_var]
-        likelihood_hdi_50: DataArray = az.hdi(
-            ary=posterior_predictive_data, hdi_prob=0.50
-        )[self.output_var]
+        """Plot posterior distribution from the model fit.
+
+        Parameters
+        ----------
+        original_scale : bool, optional
+            Whether to plot in the original scale.
+        ax : plt.Axes, optional
+            Matplotlib axis object.
+        **plt_kwargs
+            Keyword arguments passed to `plt.subplots`.
+
+        Returns
+        -------
+        plt.Figure
+        """
+        try:
+            posterior_predictive_data: Dataset = self.posterior_predictive
+
+        except Exception as e:
+            raise RuntimeError(
+                "Make sure the model has bin fitted and the posterior predictive has been sampled!"
+            ) from e
+
+        target_to_plot = np.asarray(
+            self.y
+            if original_scale
+            else transform_1d_array(self.get_target_transformer().transform, self.y)
+        )
+
+        if len(target_to_plot) != len(posterior_predictive_data.date):
+            raise ValueError(
+                "The length of the target variable doesn't match the length of the date column. "
+                "If you are predicting out-of-sample, please overwrite `self.y` with the "
+                "corresponding (non-transformed) target variable."
+            )
+
+        if ax is None:
+            fig, ax = plt.subplots(**plt_kwargs)
+        else:
+            fig = ax.figure
+
+        for hdi_prob, alpha in zip((0.94, 0.50), (0.2, 0.4), strict=True):
+            likelihood_hdi: DataArray = az.hdi(
+                ary=posterior_predictive_data, hdi_prob=hdi_prob
+            )[self.output_var]
+
+            if original_scale:
+                likelihood_hdi = self.get_target_transformer().inverse_transform(
+                    Xt=likelihood_hdi
+                )
+
+            ax.fill_between(
+                x=posterior_predictive_data.date,
+                y1=likelihood_hdi[:, 0],
+                y2=likelihood_hdi[:, 1],
+                color="C0",
+                alpha=alpha,
+                label=f"${100 * hdi_prob}\%$ HDI",  # noqa: W605
+            )
+
+        ax.plot(
+            np.asarray(posterior_predictive_data.date),
+            target_to_plot,
+            color="black",
+            label="Observed",
+        )
+        ax.legend()
+        ax.set(
+            title="Posterior Predictive Check",
+            xlabel="date",
+            ylabel=self.output_var,
+        )
+
+        return fig
+
+    def get_errors(self, original_scale: bool = False) -> DataArray:
+        """Get model errors posterior distribution.
+
+        errors = true values - predicted
+
+        Parameters
+        ----------
+        original_scale : bool, optional
+            Whether to plot in the original scale.
+
+        Returns
+        -------
+        DataArray
+        """
+        try:
+            posterior_predictive_data: Dataset = self.posterior_predictive
+
+        except Exception as e:
+            raise RuntimeError(
+                "Make sure the model has bin fitted and the posterior predictive has been sampled!"
+            ) from e
+
+        target_array = np.asarray(
+            transform_1d_array(self.get_target_transformer().transform, self.y)
+        )
+
+        if len(target_array) != len(posterior_predictive_data.date):
+            raise ValueError(
+                "The length of the target variable doesn't match the length of the date column. "
+                "If you are computing out-of-sample errors, please overwrite `self.y` with the "
+                "corresponding (non-transformed) target variable."
+            )
+
+        target = (
+            pd.Series(target_array, index=self.posterior_predictive.date)
+            .rename_axis("date")
+            .to_xarray()
+        )
+
+        errors = (
+            (target - posterior_predictive_data)[self.output_var]
+            .rename("errors")
+            .transpose(..., "date")
+        )
 
         if original_scale:
-            likelihood_hdi_94 = self.get_target_transformer().inverse_transform(
-                Xt=likelihood_hdi_94
-            )
-            likelihood_hdi_50 = self.get_target_transformer().inverse_transform(
-                Xt=likelihood_hdi_50
-            )
-
-        fig, ax = plt.subplots(**plt_kwargs)
-        if self.X is not None and self.y is not None:
-            ax.fill_between(
-                x=self.X[self.date_column],
-                y1=likelihood_hdi_94[:, 0],
-                y2=likelihood_hdi_94[:, 1],
-                color="C0",
-                alpha=0.2,
-                label="$94\%$ HDI",  # noqa: W605
+            return apply_sklearn_transformer_across_dim(
+                data=errors,
+                func=self.get_target_transformer().inverse_transform,
+                dim_name="date",
             )
 
-            ax.fill_between(
-                x=self.X[self.date_column],
-                y1=likelihood_hdi_50[:, 0],
-                y2=likelihood_hdi_50[:, 1],
-                color="C0",
-                alpha=0.3,
-                label="$50\%$ HDI",  # noqa: W605
-            )
+        return errors
 
-            target_to_plot: np.ndarray = np.asarray(
-                self.y if original_scale else self.preprocessed_data["y"]  # type: ignore
-            )
-            ax.plot(
-                np.asarray(self.X[self.date_column]),
-                target_to_plot,
-                color="black",
-            )
-            ax.set(
-                title="Posterior Predictive Check",
-                xlabel="date",
-                ylabel=self.output_var,
-            )
+    def plot_errors(
+        self, original_scale: bool = False, ax: plt.Axes = None, **plt_kwargs: Any
+    ) -> plt.Figure:
+        """Plot model errors by taking the difference between true values and predicted.
+
+        errors = true values - predicted
+
+        Parameters
+        ----------
+        original_scale : bool, optional
+            Whether to plot in the original scale.
+        ax : plt.Axes, optional
+            Matplotlib axis object.
+        **plt_kwargs
+            Keyword arguments passed to `plt.subplots`.
+
+        Returns
+        -------
+        plt.Figure
+        """
+        errors = self.get_errors(original_scale=original_scale)
+
+        if ax is None:
+            fig, ax = plt.subplots(**plt_kwargs)
         else:
-            raise RuntimeError("The model hasn't been fit yet, call .fit() first")
+            fig = ax.figure
+
+        for hdi_prob, alpha in zip((0.94, 0.50), (0.2, 0.4), strict=True):
+            errors_hdi = az.hdi(ary=errors, hdi_prob=hdi_prob)
+
+            ax.fill_between(
+                x=self.posterior_predictive.date,
+                y1=errors_hdi["errors"].sel(hdi="lower"),
+                y2=errors_hdi["errors"].sel(hdi="higher"),
+                color="C3",
+                alpha=alpha,
+                label=f"${100 * hdi_prob}\%$ HDI",  # noqa: W605
+            )
+
+        ax.plot(
+            self.posterior_predictive.date,
+            errors.mean(dim=("chain", "draw")).to_numpy(),
+            color="C3",
+            label="Errors Mean",
+        )
+
+        ax.axhline(y=0.0, linestyle="--", color="black", label="zero")
+        ax.legend()
+        ax.set(
+            title="Errors Posterior Distribution",
+            xlabel="date",
+            ylabel="true - predictions",
+        )
         return fig
 
     def _format_model_contributions(self, var_contribution: str) -> DataArray:
@@ -435,11 +588,18 @@ class BaseMMM(ModelBuilder):
             intercept = az.extract(
                 self.fit_result, var_names=["intercept"], combined=False
             )
-            intercept_hdi = np.repeat(
-                a=az.hdi(intercept).intercept.data[None, ...],
-                repeats=self.X[self.date_column].shape[0],
-                axis=0,
-            )
+
+            if intercept.ndim == 2:
+                # Intercept has a stationary prior
+                intercept_hdi = np.repeat(
+                    a=az.hdi(intercept).intercept.data[None, ...],
+                    repeats=self.X[self.date_column].shape[0],
+                    axis=0,
+                )
+            elif intercept.ndim == 3:
+                # Intercept has a time-varying prior
+                intercept_hdi = az.hdi(intercept).intercept.data
+
             ax.plot(
                 np.asarray(self.X[self.date_column]),
                 np.full(len(self.X[self.date_column]), intercept.mean().data),
@@ -1028,6 +1188,7 @@ class BaseMMM(ModelBuilder):
 
             def legend_title_func(channel):
                 return "Legend"
+
         else:
             nrows = len(channels_to_plot)
             figsize = (12, 4 * len(channels_to_plot))
@@ -1162,7 +1323,7 @@ class BaseMMM(ModelBuilder):
             )
 
         if getattr(self, "yearly_seasonality", None):
-            contributions_fourier_over_time = (
+            contributions_fourier_over_time = pd.DataFrame(
                 az.extract(
                     self.fit_result,
                     var_names=["fourier_contributions"],
@@ -1172,6 +1333,8 @@ class BaseMMM(ModelBuilder):
                 .to_dataframe()
                 .squeeze()
                 .unstack()
+                .sum(axis=1),
+                columns=["yearly_seasonality"],
             )
         else:
             contributions_fourier_over_time = pd.DataFrame(
@@ -1299,6 +1462,123 @@ class BaseMMM(ModelBuilder):
 
     def graphviz(self, **kwargs):
         return pm.model_to_graphviz(self.model, **kwargs)
+
+    def _process_decomposition_components(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Process data to compute the sum of contributions by component and calculate their percentages.
+        The output dataframe will have columns for "component", "contribution", and "percentage".
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Dataframe containing the contribution by component from the function "compute_mean_contributions_over_time".
+
+        Returns
+        -------
+        pd.DataFrame
+            A dataframe with contributions summed up by component, sorted by contribution in ascending order.
+            With an additional column showing the percentage contribution of each component.
+        """
+
+        dataframe = data.copy()
+        stack_dataframe = dataframe.stack().reset_index()
+        stack_dataframe.columns = pd.Index(["date", "component", "contribution"])
+        stack_dataframe.set_index(["date", "component"], inplace=True)
+        dataframe = stack_dataframe.groupby("component").sum()
+        dataframe.sort_values(by="contribution", ascending=True, inplace=True)
+        dataframe.reset_index(inplace=True)
+
+        total_contribution = dataframe["contribution"].sum()
+        dataframe["percentage"] = (dataframe["contribution"] / total_contribution) * 100
+
+        return dataframe
+
+    def plot_waterfall_components_decomposition(
+        self,
+        original_scale: bool = True,
+        figsize: tuple[int, int] = (14, 7),
+        **kwargs,
+    ) -> plt.Figure:
+        """
+        This function creates a waterfall plot. The plot shows the decomposition of the target into its components.
+
+        Parameters
+        ----------
+        original_scale : bool, optional
+            If True, the contributions are plotted in the original scale of the target.
+        figsize : Tuple, optional
+            The size of the figure. The default is (14, 7).
+        **kwargs
+            Additional keyword arguments to pass to the matplotlib `subplots` function.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The matplotlib figure object.
+        """
+
+        dataframe = self.compute_mean_contributions_over_time(
+            original_scale=original_scale
+        )
+
+        dataframe = self._process_decomposition_components(data=dataframe)
+        total_contribution = dataframe["contribution"].sum()
+
+        fig, ax = plt.subplots(figsize=figsize, layout="constrained", **kwargs)
+
+        cumulative_contribution = 0
+
+        for index, row in dataframe.iterrows():
+            color = "C0" if row["contribution"] >= 0 else "C3"
+
+            bar_start = (
+                cumulative_contribution + row["contribution"]
+                if row["contribution"] < 0
+                else cumulative_contribution
+            )
+            ax.barh(
+                row["component"],
+                row["contribution"],
+                left=bar_start,
+                color=color,
+                alpha=0.5,
+            )
+
+            if row["contribution"] > 0:
+                cumulative_contribution += row["contribution"]
+
+            label_pos = bar_start + (row["contribution"] / 2)
+
+            if row["contribution"] < 0:
+                label_pos = bar_start - (row["contribution"] / 2)
+
+            ax.text(
+                label_pos,
+                index,
+                f"{row['contribution']:,.0f}\n({row['percentage']:.1f}%)",
+                ha="center",
+                va="center",
+                color="black",
+                fontsize=10,
+            )
+
+        ax.set_title("Response Decomposition Waterfall by Components")
+        ax.set_xlabel("Cumulative Contribution")
+        ax.set_ylabel("Components")
+
+        xticks = np.linspace(0, total_contribution, num=11)
+        xticklabels = [f"{(x/total_contribution)*100:.0f}%" for x in xticks]
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(xticklabels)
+
+        ax.spines["right"].set_visible(False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["left"].set_visible(False)
+
+        ax.set_yticks(np.arange(len(dataframe)))
+        ax.set_yticklabels(dataframe["component"])
+
+        return fig
 
 
 class MMM(BaseMMM, ValidateTargetColumn, ValidateDateColumn, ValidateChannelColumns):
